@@ -27,6 +27,10 @@ DATE_COLUMNS = [
     "wip_date", "plant prod date", "handover date", "rfd_date", "dispatch_date"
 ]
 
+AUDIT_COLUMNS = [
+    "id", "username", "timestamp", "Batch No", "column_updated", "old_date", "new_date"
+]
+
 # User Credentials & Role Mapping
 USERS = {
     "admin": {"password": "admin123", "role": "admin", "target_col": None, "label": "Project Manager / Admin"},
@@ -72,8 +76,44 @@ def init_db():
             dispatch_date TEXT
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            "Batch No" TEXT NOT NULL,
+            column_updated TEXT NOT NULL,
+            old_date TEXT,
+            new_date TEXT
+        )
+    """)
     conn.commit()
     conn.close()
+
+def write_audit_entries(entries):
+    """
+    Appends audit records to SQLite audit_log table.
+    Each entry is a tuple: (username, timestamp, batch_no, column_updated, old_date, new_date)
+    """
+    if not entries:
+        return
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.executemany(
+        """
+        INSERT INTO audit_log (username, timestamp, "Batch No", column_updated, old_date, new_date)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        entries
+    )
+    conn.commit()
+    conn.close()
+
+def load_audit_log_df():
+    conn = get_connection()
+    df = pd.read_sql_query('SELECT * FROM audit_log ORDER BY id DESC', conn)
+    conn.close()
+    return df
 
 def clean_date_str(val):
     """Normalizes dates to YYYY-MM-DD string or empty string if blank/NaT."""
@@ -134,14 +174,12 @@ def load_master_df():
 
 def save_master_df(df):
     df = recalculate_all_statuses(df)
-    # Ensure exact column order
     for col in MASTER_COLUMNS:
         if col not in df.columns:
             df[col] = ""
     df = df[MASTER_COLUMNS]
     conn = get_connection()
     df.to_sql("project_master", conn, if_exists="replace", index=False)
-    # Recreate primary key index on Batch No
     conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_batch_no ON project_master ("Batch No")')
     conn.commit()
     conn.close()
@@ -197,24 +235,20 @@ def build_wip_ageing_pivot(df, group_col, ref_date):
         fill_value=0.0
     )
 
-    # Ensure all 5 buckets appear in exact order
     for b in AGEING_BUCKETS:
         if b not in pivot.columns:
             pivot[b] = 0.0
     pivot = pivot[AGEING_BUCKETS]
 
-    # Add Row Total
     pivot["Total WIP Wt (MT)"] = pivot.sum(axis=1)
     pivot = pivot.reset_index()
 
-    # Add Grand Total Row
     total_row = {group_col: "GRAND TOTAL"}
     for col in AGEING_BUCKETS + ["Total WIP Wt (MT)"]:
         total_row[col] = pivot[col].sum()
 
     pivot = pd.concat([pivot, pd.DataFrame([total_row])], ignore_index=True)
 
-    # Round numeric columns to 3 decimal places
     for col in AGEING_BUCKETS + ["Total WIP Wt (MT)"]:
         pivot[col] = pivot[col].round(3)
 
@@ -250,7 +284,7 @@ if not st.session_state.logged_in:
 
         with st.expander("Default Credentials Reference"):
             st.markdown("""
-            - **Admin:** `admin` / `admin123` *(Full access to all tabs, Master Upload & DB Backup)*
+            - **Admin:** `admin` / `admin123` *(Full access to all tabs, Master Upload, Audit Log & DB Backup)*
             - **User 1:** `user1` / `user123` *(Batch Upload: `wip_date`)*
             - **User 2:** `user2` / `user123` *(Batch Upload: `plant prod date`)*
             - **User 3:** `user3` / `user123` *(Batch Upload: `handover date`)*
@@ -278,18 +312,21 @@ with st.sidebar:
     st.header("💾 Database & Export")
 
     master_df = load_master_df()
+    audit_df = load_audit_log_df()
 
-    # Export Master Sheet as Excel
-    excel_export = to_excel_bytes({"Project_Master": master_df})
+    export_sheets = {"Project_Master": master_df}
+    if is_admin:
+        export_sheets["Audit_Log"] = audit_df
+
+    excel_export = to_excel_bytes(export_sheets)
     st.download_button(
-        label="📥 Export Master Sheet (.xlsx)",
+        label="📥 Export Workbook (.xlsx)",
         data=excel_export,
-        file_name=f"FabTech_Project_Master_{date.today()}.xlsx",
+        file_name=f"FabTech_WIP_Export_{date.today()}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
 
-    # Export Raw SQLite Database Backup
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "rb") as f:
             db_bytes = f.read()
@@ -301,7 +338,6 @@ with st.sidebar:
             use_container_width=True
         )
 
-    # Admin-only DB Restore
     if is_admin:
         st.subheader("Restore Database (.db)")
         uploaded_db = st.file_uploader("Upload .db backup file", type=["db"], key="db_restore_uploader")
@@ -309,6 +345,7 @@ with st.sidebar:
             if st.button("⚠️ Overwrite & Restore DB", use_container_width=True):
                 with open(DB_FILE, "wb") as f:
                     f.write(uploaded_db.getbuffer())
+                init_db()
                 st.success("Database restored successfully!")
                 st.rerun()
 
@@ -319,10 +356,9 @@ def render_stage_uploader(target_col, role_title):
     st.subheader(f"📤 Batch Date Upload — {role_title}")
     st.info(
         f"Upload an Excel (`.xlsx`) or CSV file containing **`Batch No`** and **`{target_col}`**. "
-        f"The system will verify quantities and weights against existing dates before overwriting."
+        f"The system will verify quantities and weights against existing dates before overwriting and log every change."
     )
 
-    # Provide sample template download
     sample_template = pd.DataFrame({
         "Batch No": ["ABC123", "ABC124"],
         target_col: [str(date.today()), str(date.today())]
@@ -350,7 +386,6 @@ def render_stage_uploader(target_col, role_title):
             st.error(f"Error reading file: {e}")
             return
 
-        # Validate required columns
         if "Batch No" not in up_df.columns or target_col not in up_df.columns:
             st.error(f"Uploaded file must contain exact columns: `Batch No` and `{target_col}`.")
             st.write("Detected columns:", list(up_df.columns))
@@ -358,8 +393,11 @@ def render_stage_uploader(target_col, role_title):
 
         up_df["Batch No"] = up_df["Batch No"].astype(str).str.strip()
         up_df[target_col] = up_df[target_col].apply(clean_date_str)
-        # Drop rows with empty Batch No or empty new date
-        valid_up = up_df[(up_df["Batch No"] != "") & (up_df["Batch No"].str.lower() != "nan") & (up_df[target_col] != "")].copy()
+        valid_up = up_df[
+            (up_df["Batch No"] != "")
+            & (up_df["Batch No"].str.lower() != "nan")
+            & (up_df[target_col] != "")
+        ].copy()
         valid_up = valid_up.drop_duplicates(subset=["Batch No"], keep="last")
 
         if valid_up.empty:
@@ -371,7 +409,6 @@ def render_stage_uploader(target_col, role_title):
             st.error("Project Master Sheet is currently empty. Ask Admin to upload Master Sheet first.")
             return
 
-        # Merge uploaded batches with Master Sheet to analyze impact
         merged = pd.merge(
             valid_up[["Batch No", target_col]].rename(columns={target_col: "New_Date"}),
             current_master[["Batch No", "project_no", "mark_no", "qty", "actual_wt", target_col]].rename(columns={target_col: "Existing_Date"}),
@@ -384,9 +421,7 @@ def render_stage_uploader(target_col, role_title):
         unmatched = merged[merged["_merge"] == "left_only"].copy()
 
         already_dated = matched[matched["Existing_Date"] != ""]
-        fresh_dated = matched[matched["Existing_Date"] == ""]
 
-        # Summary Reconciliation Metrics
         st.markdown("### 📊 Pre-Upload Reconciliation Summary")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Matched Batches", len(matched), f"{len(unmatched)} Unmatched")
@@ -430,11 +465,27 @@ def render_stage_uploader(target_col, role_title):
             )
 
             if st.button("✅ Confirm & Apply Update to Master Sheet", type="primary", disabled=not confirm_chk):
-                date_map = dict(zip(matched["Batch No"], matched["New_Date"]))
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                audit_rows = []
+                date_map = {}
+
+                for _, row in matched.iterrows():
+                    b_no = row["Batch No"]
+                    old_d = clean_date_str(row["Existing_Date"])
+                    new_d = clean_date_str(row["New_Date"])
+                    date_map[b_no] = new_d
+                    if old_d != new_d:
+                        audit_rows.append((current_user, ts, b_no, target_col, old_d, new_d))
+
                 mask = current_master["Batch No"].isin(date_map.keys())
                 current_master.loc[mask, target_col] = current_master.loc[mask, "Batch No"].map(date_map)
                 save_master_df(current_master)
-                st.success(f"Successfully updated `{target_col}` for {len(matched)} batches and recalculated statuses!")
+                write_audit_entries(audit_rows)
+
+                st.success(
+                    f"Updated `{target_col}` for {len(matched)} batches, logged {len(audit_rows)} changes to Audit Log, "
+                    f"and recalculated statuses!"
+                )
                 st.rerun()
 
 # ---------------------------------------------------------------------------
@@ -449,11 +500,12 @@ if not is_admin:
     st.stop()
 
 # === VIEW B: ADMIN (ALL TABS ACCESS) ===
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📋 1. Project Master Sheet",
     "📤 2. Stage Date Batch Upload (Admin)",
     "📊 3. WIP Ageing — Project Wise",
-    "🏭 4. WIP Ageing — Contractor Wise"
+    "🏭 4. WIP Ageing — Contractor Wise",
+    "📜 5. Audit Log"
 ])
 
 # ---------------------------------------------------------------------------
@@ -468,7 +520,6 @@ with tab1:
         `sr_no`, `Batch No`, `project_no`, `description`, `revision_no`, `drawing_no`, `element_type`, `mark_no`, `qty`, `part_sl_no`, `actual_wt`, `draw_total_wt`, `contractor`, `plant`, `status`, `wip_date`, `plant prod date`, `handover date`, `rfd_date`, `dispatch_date`
         """)
 
-        # Sample Master Template matching user's exact example
         sample_master = pd.DataFrame([
             {
                 "sr_no": 1, "Batch No": "ABC123", "project_no": "201", "description": "CT-T1",
@@ -509,7 +560,6 @@ with tab1:
                 else:
                     new_m_df = pd.read_excel(master_upload, dtype={"Batch No": str, "project_no": str, "part_sl_no": str})
 
-                # Ensure missing optional columns are initialized
                 for col in MASTER_COLUMNS:
                     if col not in new_m_df.columns:
                         new_m_df[col] = ""
@@ -525,20 +575,35 @@ with tab1:
                 st.dataframe(new_m_df.head(10), use_container_width=True)
 
                 if st.button("🚀 Save Master Sheet to Database", type="primary"):
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    audit_rows = []
+                    existing_lookup = {}
+                    if not master_df.empty:
+                        existing_lookup = master_df.set_index("Batch No").to_dict(orient="index")
+
+                    for _, r in new_m_df.iterrows():
+                        b_no = r["Batch No"]
+                        prev_row = existing_lookup.get(b_no, {})
+                        for dcol in DATE_COLUMNS:
+                            old_d = clean_date_str(prev_row.get(dcol, ""))
+                            new_d = clean_date_str(r.get(dcol, ""))
+                            if old_d != new_d:
+                                audit_rows.append((current_user, ts, b_no, dcol, old_d, new_d))
+
                     if upload_mode.startswith("Replace") or master_df.empty:
                         save_master_df(new_m_df)
                     else:
-                        # Upsert on Batch No
                         existing_idx = master_df.set_index("Batch No")
                         incoming_idx = new_m_df.set_index("Batch No")
                         combined = incoming_idx.combine_first(existing_idx).reset_index()
                         save_master_df(combined)
-                    st.success("Project Master Sheet updated and statuses recalculated!")
+
+                    write_audit_entries(audit_rows)
+                    st.success(f"Project Master Sheet updated, {len(audit_rows)} date changes logged, and statuses recalculated!")
                     st.rerun()
             except Exception as e:
                 st.error(f"Failed to process Master Sheet: {e}")
 
-    # KPI Summary Strip
     if not master_df.empty:
         st.divider()
         k1, k2, k3, k4, k5, k6 = st.columns(6)
@@ -550,7 +615,6 @@ with tab1:
         wip_only_wt = master_df[~master_df["status"].isin(["DISP", "YTS"])]["actual_wt"].sum()
         k6.metric("Active WIP Wt (MT)", f"{wip_only_wt:.3f}")
 
-        # Filters
         f1, f2, f3 = st.columns(3)
         proj_filter = f1.multiselect("Filter Project No", sorted(master_df["project_no"].unique()))
         cont_filter = f2.multiselect("Filter Contractor", sorted(master_df["contractor"].dropna().unique()))
@@ -569,7 +633,7 @@ with tab1:
         st.info("No records in Project Master yet. Use the batch upload panel above to load data.")
 
 # ---------------------------------------------------------------------------
-# TAB 2: ADMIN STAGE DATE UPLOADER (TEST / OVERRIDE ANY USER STAGE)
+# TAB 2: ADMIN STAGE DATE UPLOADER
 # ---------------------------------------------------------------------------
 with tab2:
     selected_stage = st.selectbox(
@@ -624,5 +688,38 @@ with tab4:
             label="📥 Export Contractor WIP Ageing (.xlsx)",
             data=to_excel_bytes({"WIP_Ageing_Contractor": cont_pivot}),
             file_name=f"WIP_Ageing_Contractor_{ref_date_cont}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+# ---------------------------------------------------------------------------
+# TAB 5: AUDIT LOG (ADMIN ONLY)
+# ---------------------------------------------------------------------------
+with tab5:
+    st.subheader("📜 Batch Upload Audit Log")
+    st.caption("Tracks every batch upload date modification: `username`, `timestamp`, `Batch No`, `column_updated`, `old_date`, and `new_date`.")
+
+    if audit_df.empty:
+        st.info("No audit log entries recorded yet.")
+    else:
+        af1, af2, af3 = st.columns(3)
+        u_filter = af1.multiselect("Filter by User", sorted(audit_df["username"].unique()))
+        c_filter = af2.multiselect("Filter by Column Updated", sorted(audit_df["column_updated"].unique()))
+        b_search = af3.text_input("Search Batch No").strip()
+
+        filtered_audit = audit_df.copy()
+        if u_filter:
+            filtered_audit = filtered_audit[filtered_audit["username"].isin(u_filter)]
+        if c_filter:
+            filtered_audit = filtered_audit[filtered_audit["column_updated"].isin(c_filter)]
+        if b_search:
+            filtered_audit = filtered_audit[filtered_audit["Batch No"].str.contains(b_search, case=False, na=False)]
+
+        st.metric("Matching Audit Records", len(filtered_audit))
+        st.dataframe(filtered_audit, use_container_width=True, height=450)
+
+        st.download_button(
+            label="📥 Export Audit Log (.xlsx)",
+            data=to_excel_bytes({"Audit_Log": filtered_audit}),
+            file_name=f"FabTech_Audit_Log_{date.today()}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
