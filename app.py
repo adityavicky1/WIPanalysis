@@ -9,12 +9,14 @@ from datetime import datetime, date
 # 1. PAGE CONFIG & CONSTANTS
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="FabTech WIP & Fabrication Control",
+    page_title="JINDAL STEEL LIMITED | WIP & Fabrication Control",
     page_icon="🏗️",
     layout="wide"
 )
 
 DB_FILE = "fabtech_wip.db"
+CLIENT_LOGO_FILE = "images.png"
+CLIENT_NAME = "JINDAL STEEL LIMITED"
 
 MASTER_COLUMNS = [
     "sr_no", "Batch No", "project_no", "description", "revision_no",
@@ -113,6 +115,8 @@ def load_audit_log_df():
     conn = get_connection()
     df = pd.read_sql_query('SELECT * FROM audit_log ORDER BY id DESC', conn)
     conn.close()
+    if not df.empty:
+        df["Batch No"] = df["Batch No"].astype(str).str.strip()
     return df
 
 def clean_date_str(val):
@@ -254,6 +258,46 @@ def build_wip_ageing_pivot(df, group_col, ref_date):
 
     return pivot
 
+def build_stage_turnaround_df(m_row):
+    """
+    Computes elapsed days between consecutive populated fabrication stage dates
+    for a single master row.
+    """
+    records = []
+    prev_stage = None
+    prev_dt = None
+
+    for col in DATE_COLUMNS:
+        d_str = clean_date_str(m_row.get(col, ""))
+        dt_val = pd.to_datetime(d_str, errors="coerce") if d_str else pd.NaT
+
+        if pd.notna(dt_val) and pd.notna(prev_dt):
+            elapsed = (dt_val - prev_dt).days
+            elapsed_str = f"{elapsed} days"
+            span_label = f"{prev_stage} -> {col}"
+        elif pd.notna(dt_val) and prev_dt is None:
+            elapsed_str = "Start"
+            span_label = "Initial Stage"
+        elif pd.notna(dt_val):
+            elapsed_str = "—"
+            span_label = "Prior stage blank"
+        else:
+            elapsed_str = "Pending"
+            span_label = f"{prev_stage or 'Prior'} -> {col}"
+
+        records.append({
+            "Stage Column": col,
+            "Stage Date": d_str if d_str else "—",
+            "Interval": span_label,
+            "Days Elapsed": elapsed_str
+        })
+
+        if pd.notna(dt_val):
+            prev_stage = col
+            prev_dt = dt_val
+
+    return pd.DataFrame(records)
+
 # ---------------------------------------------------------------------------
 # 3. AUTHENTICATION UI
 # ---------------------------------------------------------------------------
@@ -264,11 +308,14 @@ if "logged_in" not in st.session_state:
     st.session_state.username = None
 
 if not st.session_state.logged_in:
-    st.title("🏗️ FabTech WIP & Fabrication Control System")
-    st.markdown("Please log in with your assigned credentials.")
+    col_l, col_c, col_r = st.columns([1, 1.35, 1])
+    with col_c:
+        if os.path.exists(CLIENT_LOGO_FILE):
+            st.image(CLIENT_LOGO_FILE, width=220)
+        st.markdown(f"### Client: **{CLIENT_NAME}**")
+        st.title("🏗️ WIP & Fabrication Control System")
+        st.markdown("Sign in with your assigned credentials to access the portal.")
 
-    col1, col2, col3 = st.columns([1, 1.2, 1])
-    with col2:
         with st.form("login_form"):
             uname = st.text_input("Username (admin, user1 - user5)").strip().lower()
             pwd = st.text_input("Password", type="password")
@@ -301,6 +348,9 @@ user_info = USERS[current_user]
 is_admin = user_info["role"] == "admin"
 
 with st.sidebar:
+    if os.path.exists(CLIENT_LOGO_FILE):
+        st.image(CLIENT_LOGO_FILE, width=160)
+    st.caption(f"**Client:** {CLIENT_NAME}")
     st.header("👤 Session Info")
     st.success(f"**Logged in as:** {user_info['label']}")
     if st.button("🚪 Logout", use_container_width=True):
@@ -322,7 +372,7 @@ with st.sidebar:
     st.download_button(
         label="📥 Export Workbook (.xlsx)",
         data=excel_export,
-        file_name=f"FabTech_WIP_Export_{date.today()}.xlsx",
+        file_name=f"JSL_WIP_Export_{date.today()}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
@@ -333,7 +383,7 @@ with st.sidebar:
         st.download_button(
             label="🗄️ Export SQLite DB (.db)",
             data=db_bytes,
-            file_name=f"fabtech_wip_backup_{date.today()}.db",
+            file_name=f"jsl_wip_backup_{date.today()}.db",
             mime="application/octet-stream",
             use_container_width=True
         )
@@ -491,7 +541,7 @@ def render_stage_uploader(target_col, role_title):
 # ---------------------------------------------------------------------------
 # 6. ROLE-BASED VIEW ROUTING
 # ---------------------------------------------------------------------------
-st.title("🏗️ FabTech Project Management & WIP Analysis")
+st.title(f"🏗️ {CLIENT_NAME} — WIP & Fabrication Control")
 
 # === VIEW A: USER 1 TO USER 5 (UPLOAD ONLY) ===
 if not is_admin:
@@ -692,15 +742,78 @@ with tab4:
         )
 
 # ---------------------------------------------------------------------------
-# TAB 5: AUDIT LOG (ADMIN ONLY)
+# TAB 5: AUDIT LOG & PER-BATCH CHRONOLOGICAL TIMELINE (ADMIN ONLY)
 # ---------------------------------------------------------------------------
 with tab5:
-    st.subheader("📜 Batch Upload Audit Log")
-    st.caption("Tracks every batch upload date modification: `username`, `timestamp`, `Batch No`, `column_updated`, `old_date`, and `new_date`.")
+    st.subheader("📜 Batch Upload Audit Log & Chronological Timeline")
+    st.caption("Tracks every batch upload date modification and shows elapsed days between consecutive stage dates for any selected Batch No.")
 
     if audit_df.empty:
         st.info("No audit log entries recorded yet.")
     else:
+        st.markdown("### 🕒 Batch Chronological Stage Timeline")
+        audited_batches = sorted(audit_df["Batch No"].dropna().unique())
+        selected_batch = st.selectbox("Select Batch No to inspect chronological changes:", audited_batches)
+
+        if selected_batch:
+            batch_history = audit_df[audit_df["Batch No"] == selected_batch].copy()
+            batch_history = batch_history.sort_values(by=["timestamp", "id"], ascending=[True, True]).reset_index(drop=True)
+            batch_history["Step"] = batch_history.index + 1
+
+            batch_history["new_dt"] = pd.to_datetime(batch_history["new_date"], errors="coerce")
+            batch_history["prev_new_dt"] = batch_history["new_dt"].shift(1)
+            batch_history["prev_stage"] = batch_history["column_updated"].shift(1)
+
+            def format_audit_elapsed(row):
+                if pd.isna(row["new_dt"]):
+                    return "—"
+                if pd.isna(row["prev_new_dt"]):
+                    return "First dated entry"
+                days_diff = (row["new_dt"] - row["prev_new_dt"]).days
+                return f"{days_diff} days (from {row['prev_stage']})"
+
+            batch_history["Days Since Prev Date"] = batch_history.apply(format_audit_elapsed, axis=1)
+
+            m_row = None
+            if not master_df.empty and selected_batch in master_df["Batch No"].values:
+                m_row = master_df[master_df["Batch No"] == selected_batch].iloc[0]
+                s1, s2, s3, s4 = st.columns(4)
+                s1.metric("Current Status", m_row["status"])
+                s2.metric("Project / Mark", f"{m_row['project_no']} / {m_row['mark_no']}")
+                s3.metric("Contractor", m_row["contractor"] or "N/A")
+                s4.metric("Actual Wt (MT)", f"{float(m_row['actual_wt']):.3f}")
+
+                st.markdown("#### ⏱️ Stage-to-Stage Elapsed Days (Master Stage Dates)")
+                stage_turnaround_df = build_stage_turnaround_df(m_row)
+                st.dataframe(stage_turnaround_df, use_container_width=True, hide_index=True)
+
+            st.markdown("#### 🗓️ Audit Upload Sequence & Consecutive Stage Date Delta")
+            timeline_view = batch_history[[
+                "Step", "timestamp", "column_updated", "old_date", "new_date", "Days Since Prev Date", "username"
+            ]].rename(
+                columns={
+                    "timestamp": "Upload Timestamp",
+                    "column_updated": "Stage Column",
+                    "old_date": "Previous Date",
+                    "new_date": "Updated Date",
+                    "username": "Updated By"
+                }
+            )
+            st.dataframe(timeline_view, use_container_width=True, hide_index=True)
+
+            for _, ev in batch_history.iterrows():
+                prev_display = ev["old_date"] if ev["old_date"] else "*Blank*"
+                new_display = ev["new_date"] if ev["new_date"] else "*Blank*"
+                st.markdown(
+                    f"**#{ev['Step']}** · `{ev['timestamp']}` · **`{ev['column_updated']}`**: "
+                    f"{prev_display} $\\rightarrow$ **{new_display}** · "
+                    f"*Elapsed: **{ev['Days Since Prev Date']}*** *(by `{ev['username']}`)*"
+                )
+
+        st.divider()
+
+        # Section B: Full Filterable Audit Log Table
+        st.markdown("### 📋 Complete Audit Log Table")
         af1, af2, af3 = st.columns(3)
         u_filter = af1.multiselect("Filter by User", sorted(audit_df["username"].unique()))
         c_filter = af2.multiselect("Filter by Column Updated", sorted(audit_df["column_updated"].unique()))
@@ -715,11 +828,11 @@ with tab5:
             filtered_audit = filtered_audit[filtered_audit["Batch No"].str.contains(b_search, case=False, na=False)]
 
         st.metric("Matching Audit Records", len(filtered_audit))
-        st.dataframe(filtered_audit, use_container_width=True, height=450)
+        st.dataframe(filtered_audit, use_container_width=True, height=400)
 
         st.download_button(
             label="📥 Export Audit Log (.xlsx)",
             data=to_excel_bytes({"Audit_Log": filtered_audit}),
-            file_name=f"FabTech_Audit_Log_{date.today()}.xlsx",
+            file_name=f"JSL_Audit_Log_{date.today()}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
