@@ -276,10 +276,6 @@ def normalize_header(h):
     return s
 
 def detect_header_row(preview_df):
-    """
-    Finds the true header row within the top 15 rows by counting how many cells
-    resemble known structural fabrication column names (skipping top total/summary rows).
-    """
     all_known = set()
     for aliases in COLUMN_ALIASES.values():
         for a in aliases:
@@ -301,11 +297,6 @@ def detect_header_row(preview_df):
     return best_row
 
 def approximate_column_mapping(source_columns):
-    """
-    Maps the 14 target MASTER_DATA_COLUMNS to the closest matching column in source_columns
-    using exact alias checks followed by difflib fuzzy string similarity.
-    Returns dict: {target_col: (matched_source_col_or_None, confidence_label)}
-    """
     norm_to_orig = {}
     for col in source_columns:
         col_str = str(col).strip()
@@ -318,7 +309,6 @@ def approximate_column_mapping(source_columns):
     used_sources = set()
     mapping = {}
 
-    # Pass 1: Exact normalized alias match (in priority order of COLUMN_ALIASES)
     for target_col in MASTER_DATA_COLUMNS:
         aliases = [normalize_header(a) for a in COLUMN_ALIASES.get(target_col, [target_col])]
         matched = None
@@ -332,7 +322,6 @@ def approximate_column_mapping(source_columns):
         else:
             mapping[target_col] = (None, "Not Found")
 
-    # Pass 2: Fuzzy approximation for any remaining unmatched target columns
     remaining_norms = {n: orig for n, orig in norm_to_orig.items() if orig not in used_sources}
     for target_col in MASTER_DATA_COLUMNS:
         if mapping[target_col][0] is not None:
@@ -363,9 +352,6 @@ def infer_project_code_from_filename(filename):
     return token if token else base
 
 def extract_standardized_df(raw_df, col_map, fallback_project_no="", start_sr_no=1):
-    """
-    Builds a clean 14-column DataFrame from raw_df using the confirmed column mapping.
-    """
     out = pd.DataFrame(index=raw_df.index)
 
     for target_col in MASTER_DATA_COLUMNS:
@@ -375,7 +361,6 @@ def extract_standardized_df(raw_df, col_map, fallback_project_no="", start_sr_no
         else:
             out[target_col] = ""
 
-    # Clean Batch No and filter out blank / summary / subtotal rows
     out["Batch No"] = out["Batch No"].astype(str).str.strip()
     out = out[
         (out["Batch No"] != "")
@@ -388,37 +373,28 @@ def extract_standardized_df(raw_df, col_map, fallback_project_no="", start_sr_no
     if out.empty:
         return out
 
-    # Auto-populate project_no from filename prefix if project_no column was missing or blank
     out["project_no"] = out["project_no"].fillna("").astype(str).str.strip()
     out.loc[out["project_no"].isin(["", "nan", "None"]), "project_no"] = fallback_project_no
 
-    # Clean numeric fields
     out["qty"] = pd.to_numeric(out["qty"], errors="coerce").fillna(1).astype(int)
     out["actual_wt"] = pd.to_numeric(out["actual_wt"], errors="coerce").fillna(0.0).round(5)
     out["draw_total_wt"] = pd.to_numeric(out["draw_total_wt"], errors="coerce")
     out["draw_total_wt"] = out["draw_total_wt"].fillna(out["actual_wt"]).round(5)
 
-    # Clean text fields
     for txt_col in ["description", "revision_no", "drawing_no", "element_type", "mark_no", "part_sl_no", "contractor", "plant"]:
         out[txt_col] = out[txt_col].fillna("").astype(str).str.strip()
         out.loc[out[txt_col].isin(["nan", "None", "NaT"]), txt_col] = ""
 
-    # If sr_no was missing or all zeros, generate sequential sr_no
     sr_numeric = pd.to_numeric(out["sr_no"], errors="coerce").fillna(0).astype(int)
     if (sr_numeric == 0).all():
         out["sr_no"] = range(start_sr_no, start_sr_no + len(out))
     else:
         out["sr_no"] = sr_numeric
 
-    # Deduplicate by Batch No keeping last valid entry
     out = out.drop_duplicates(subset=["Batch No"], keep="last").reset_index(drop=True)
     return out[MASTER_DATA_COLUMNS]
 
 def upsert_master_records(incoming_df, actor_username):
-    """
-    Upserts non-date Master Data records into project_master while strictly preserving
-    all existing stage dates (wip_date -> dispatch_date) and writing audit trail logs.
-    """
     current_master = load_master_df()
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     audit_rows = []
@@ -470,8 +446,55 @@ def upsert_master_records(incoming_df, actor_username):
     return new_count, upd_count
 
 # ---------------------------------------------------------------------------
-# 2C. WIP AGEING & TURNAROUND ANALYTICS HELPERS
+# 2C. PROJECT SUMMARY PIVOT, WIP AGEING & TURNAROUND ANALYTICS HELPERS
 # ---------------------------------------------------------------------------
+def build_project_status_summary_pivot(df):
+    """
+    Builds the Project Status Weight Summary table:
+    PROJECT | DISP | RFD | B&P | [BLACK OK if > 0] | WIP | YTS | GRAND TOTAL
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    work = df.copy()
+    work["PROJECT"] = work["project_no"].fillna("Unassigned").astype(str).str.strip().replace("", "Unassigned")
+    work["actual_wt"] = pd.to_numeric(work["actual_wt"], errors="coerce").fillna(0.0)
+
+    pivot = pd.pivot_table(
+        work,
+        values="actual_wt",
+        index="PROJECT",
+        columns="status",
+        aggfunc="sum",
+        fill_value=0.0
+    )
+
+    core_cols = ["DISP", "RFD", "B&P", "WIP", "YTS"]
+    for c in core_cols:
+        if c not in pivot.columns:
+            pivot[c] = 0.0
+
+    # Include BLACK OK right after B&P if any records exist in BLACK OK status
+    ordered_cols = ["DISP", "RFD", "B&P"]
+    if "BLACK OK" in pivot.columns and pivot["BLACK OK"].sum() > 0:
+        ordered_cols.append("BLACK OK")
+    ordered_cols.extend(["WIP", "YTS"])
+
+    pivot = pivot[ordered_cols]
+    pivot["GRAND TOTAL"] = pivot.sum(axis=1)
+    pivot = pivot.reset_index()
+
+    total_row = {"PROJECT": "GRAND TOTAL"}
+    for col in ordered_cols + ["GRAND TOTAL"]:
+        total_row[col] = pivot[col].sum()
+
+    pivot = pd.concat([pivot, pd.DataFrame([total_row])], ignore_index=True)
+
+    for col in ordered_cols + ["GRAND TOTAL"]:
+        pivot[col] = pivot[col].round(3)
+
+    return pivot
+
 def get_ageing_bucket(days):
     if days <= 7:
         return "0-7 Days"
@@ -484,7 +507,11 @@ def get_ageing_bucket(days):
     else:
         return ">60 Days"
 
-def build_wip_ageing_pivot(df, group_col, ref_date):
+def get_active_wip_with_ageing(df, ref_date):
+    """
+    Returns active WIP rows (status != DISP and valid wip_date) annotated with
+    Age (Days) and Ageing Bucket.
+    """
     if df.empty:
         return pd.DataFrame()
 
@@ -498,15 +525,22 @@ def build_wip_ageing_pivot(df, group_col, ref_date):
         return pd.DataFrame()
 
     ref_ts = pd.Timestamp(ref_date)
-    wip_df["age_days"] = (ref_ts - wip_df["wip_dt"]).dt.days.clip(lower=0)
-    wip_df["Bucket"] = wip_df["age_days"].apply(get_ageing_bucket)
-    wip_df[group_col] = wip_df[group_col].fillna("Unassigned").replace("", "Unassigned")
+    wip_df["Age (Days)"] = (ref_ts - wip_df["wip_dt"]).dt.days.clip(lower=0).astype(int)
+    wip_df["Ageing Bucket"] = wip_df["Age (Days)"].apply(get_ageing_bucket)
+    wip_df["project_no"] = wip_df["project_no"].fillna("Unassigned").replace("", "Unassigned")
+    wip_df["contractor"] = wip_df["contractor"].fillna("Unassigned").replace("", "Unassigned")
+    return wip_df.drop(columns=["wip_dt"])
+
+def build_wip_ageing_pivot(df, group_col, ref_date):
+    wip_df = get_active_wip_with_ageing(df, ref_date)
+    if wip_df.empty:
+        return pd.DataFrame()
 
     pivot = pd.pivot_table(
         wip_df,
         values="actual_wt",
         index=group_col,
-        columns="Bucket",
+        columns="Ageing Bucket",
         aggfunc="sum",
         fill_value=0.0
     )
@@ -529,6 +563,65 @@ def build_wip_ageing_pivot(df, group_col, ref_date):
         pivot[col] = pivot[col].round(3)
 
     return pivot
+
+def render_ageing_bucket_drilldown(master_df, ref_date, entity_col, entity_label, key_prefix):
+    """
+    Renders a bucket & entity selector to extract the exact Project Master rows
+    falling into the selected ageing bucket (e.g. 0-7 Days) with Excel export.
+    """
+    wip_aged_df = get_active_wip_with_ageing(master_df, ref_date)
+    if wip_aged_df.empty:
+        return
+
+    st.divider()
+    st.markdown(f"### 🔍 Extract Master List by Ageing Bucket ({entity_label}-Wise)")
+    st.caption("Select an ageing bucket (and optional filter) to inspect and download the matching Project Master records.")
+
+    c1, c2 = st.columns([1, 1.2])
+    bucket_options = ["All Active WIP Buckets"] + AGEING_BUCKETS
+    selected_bucket = c1.selectbox(
+        "Select Ageing Bucket:",
+        options=bucket_options,
+        index=1,  # Defaults to '0-7 Days'
+        key=f"{key_prefix}_bucket_sel"
+    )
+
+    entities = sorted(wip_aged_df[entity_col].dropna().unique().tolist())
+    selected_entities = c2.multiselect(
+        f"Filter by {entity_label} (Optional — leave empty for all):",
+        options=entities,
+        key=f"{key_prefix}_entity_sel"
+    )
+
+    drill_df = wip_aged_df.copy()
+    if selected_bucket != "All Active WIP Buckets":
+        drill_df = drill_df[drill_df["Ageing Bucket"] == selected_bucket]
+    if selected_entities:
+        drill_df = drill_df[drill_df[entity_col].isin(selected_entities)]
+
+    drill_df = drill_df.sort_values(by=["Age (Days)", "sr_no"], ascending=[False, True]).reset_index(drop=True)
+
+    # Place Ageing Bucket and Age (Days) right next to Master Columns for clarity
+    display_cols = ["Ageing Bucket", "Age (Days)"] + MASTER_COLUMNS
+    drill_df = drill_df[[c for c in display_cols if c in drill_df.columns]]
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Matching Batches", len(drill_df))
+    m2.metric("Matching Qty", int(drill_df["qty"].sum()) if not drill_df.empty else 0)
+    m3.metric("Matching Actual Wt (MT)", f"{drill_df['actual_wt'].sum():.3f}" if not drill_df.empty else "0.000")
+
+    if drill_df.empty:
+        st.info(f"No active WIP records found in **{selected_bucket}** for the selected filter.")
+    else:
+        st.dataframe(drill_df, use_container_width=True, height=380)
+        safe_bucket_tag = selected_bucket.replace(" ", "_").replace(">", "GT_")
+        st.download_button(
+            label=f"📥 Export Master List — {selected_bucket} (.xlsx)",
+            data=to_excel_bytes({f"WIP_{safe_bucket_tag}": drill_df}),
+            file_name=f"WIP_Master_{entity_label}_{safe_bucket_tag}_{ref_date}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{key_prefix}_dl_btn"
+        )
 
 def build_stage_turnaround_df(m_row):
     records = []
@@ -599,13 +692,13 @@ if not st.session_state.logged_in:
 
         with st.expander("Default Credentials Reference"):
             st.markdown("""
-            - **PMH / Admin:** `admin` / `admin123` *(Full View + Master Data Upload; Stage Dates Locked)*
-            - **PMG:** `pmg` / `pmg123` *(Master Sheet Builder from Go-Live Files + Drawing Upload; Stage Dates Locked)*
-            - **User 1:** `user1` / `user123` *(Batch Upload: `wip_date` ONLY)*
-            - **User 2:** `user2` / `user123` *(Batch Upload: `plant prod date` ONLY)*
-            - **User 3:** `user3` / `user123` *(Batch Upload: `handover date` ONLY)*
-            - **User 4:** `user4` / `user123` *(Batch Upload: `rfd_date` ONLY)*
-            - **User 5:** `user5` / `user123` *(Batch Upload: `dispatch_date` ONLY)*
+- **PMH / Admin:** `admin` / `admin123` *(Full View + Status Summary + Master Data Upload; Stage Dates Locked)*
+- **PMG:** `pmg` / `pmg123` *(Master Sheet Builder from Go-Live Files + Drawing Upload; Stage Dates Locked)*
+- **User 1:** `user1` / `user123` *(Batch Upload: `wip_date` ONLY)*
+- **User 2:** `user2` / `user123` *(Batch Upload: `plant prod date` ONLY)*
+- **User 3:** `user3` / `user123` *(Batch Upload: `handover date` ONLY)*
+- **User 4:** `user4` / `user123` *(Batch Upload: `rfd_date` ONLY)*
+- **User 5:** `user5` / `user123` *(Batch Upload: `dispatch_date` ONLY)*
             """)
     st.stop()
 
@@ -637,7 +730,12 @@ with st.sidebar:
     audit_df = load_audit_log_df()
 
     if is_admin:
-        export_sheets = {"Project_Master": master_df, "Audit_Log": audit_df}
+        summary_pivot_export = build_project_status_summary_pivot(master_df)
+        export_sheets = {
+            "Project_Master": master_df,
+            "Project_Status_Summary": summary_pivot_export,
+            "Audit_Log": audit_df
+        }
         excel_export = to_excel_bytes(export_sheets)
         st.download_button(
             label="📥 Export Full Workbook (.xlsx)",
@@ -687,7 +785,6 @@ def render_pmg_master_builder():
                 else:
                     xls = pd.ExcelFile(io.BytesIO(file_bytes))
                     sheet_names = xls.sheet_names
-                    # Auto-select 'MASTER' (case-insensitive) if available
                     master_idx = 0
                     for s_i, s_name in enumerate(sheet_names):
                         if s_name.strip().upper() == "MASTER":
@@ -718,7 +815,6 @@ def render_pmg_master_builder():
                     key=f"proj_ovr_{idx}_{fname}"
                 ).strip()
 
-                # Read full sheet with chosen header row
                 if fname.lower().endswith(".csv"):
                     full_raw_df = pd.read_csv(io.BytesIO(file_bytes), header=int(header_row_num), dtype=str)
                 else:
@@ -728,7 +824,6 @@ def render_pmg_master_builder():
                 full_raw_df.columns = source_cols
                 auto_map = approximate_column_mapping(source_cols)
 
-                # Interactive Header Mapping Review & Override
                 st.markdown("##### 🔍 Header Approximation & Mapping Review")
                 dropdown_options = ["(None / Leave Blank)"] + source_cols
                 confirmed_map = {}
@@ -781,7 +876,6 @@ def render_pmg_master_builder():
         st.subheader("📦 Consolidated Master Sheet Preview (Ready for Drawing Upload)")
 
         combined_df = pd.concat(extracted_frames, ignore_index=True)
-        # Re-number sr_no sequentially across combined files and deduplicate Batch No
         combined_df = combined_df.drop_duplicates(subset=["Batch No"], keep="last").reset_index(drop=True)
         combined_df["sr_no"] = range(1, len(combined_df) + 1)
 
@@ -1082,11 +1176,13 @@ if is_pmg:
         render_master_data_uploader("PMG Engineering & Allocation", allow_full_replace=False)
     st.stop()
 
-tab1, tab2, tab3, tab4 = st.tabs([
+# Admin (PMH) Tabs
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📋 1. Project Master Sheet (PMH)",
-    "📊 2. WIP Ageing — Project Wise",
-    "🏭 3. WIP Ageing — Contractor Wise",
-    "📜 4. Audit Log & Batch Timeline"
+    "📈 2. Project Status Summary",
+    "📊 3. WIP Ageing — Project Wise",
+    "🏭 4. WIP Ageing — Contractor Wise",
+    "📜 5. Audit Log & Batch Timeline"
 ])
 
 with tab1:
@@ -1124,6 +1220,27 @@ with tab1:
         st.info("No records in Project Master yet. Use the PMH batch upload panel above to load data.")
 
 with tab2:
+    st.subheader("📈 Project Status Summary Pivot (Actual Wt in MT)")
+    st.caption("Summarizes total Actual Weight (MT) across fabrication stages by Project Number.")
+
+    summary_pivot = build_project_status_summary_pivot(master_df)
+    if summary_pivot.empty:
+        st.info("No records in Project Master yet to generate the Project Status Summary.")
+    else:
+        num_cols = [c for c in summary_pivot.columns if c != "PROJECT"]
+        st.dataframe(
+            summary_pivot.style.format({col: "{:.3f}" for col in num_cols}),
+            use_container_width=True,
+            hide_index=True
+        )
+        st.download_button(
+            label="📥 Export Project Status Summary (.xlsx)",
+            data=to_excel_bytes({"Project_Status_Summary": summary_pivot}),
+            file_name=f"Project_Status_Summary_{date.today()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+with tab3:
     st.subheader("📊 WIP Ageing Analysis — Project Wise (Actual Wt in MT)")
     st.caption("Includes all items with a valid `wip_date` where `status` is NOT `DISP`. Ageing = Reference Date minus `wip_date`.")
 
@@ -1135,7 +1252,8 @@ with tab2:
     else:
         st.dataframe(
             proj_pivot.style.format({col: "{:.3f}" for col in AGEING_BUCKETS + ["Total WIP Wt (MT)"]}),
-            use_container_width=True
+            use_container_width=True,
+            hide_index=True
         )
         st.download_button(
             label="📥 Export Project WIP Ageing (.xlsx)",
@@ -1143,8 +1261,9 @@ with tab2:
             file_name=f"WIP_Ageing_Project_{ref_date_proj}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+        render_ageing_bucket_drilldown(master_df, ref_date_proj, "project_no", "Project", "proj_age")
 
-with tab3:
+with tab4:
     st.subheader("🏭 WIP Ageing Analysis — Contractor Wise (Actual Wt in MT)")
     st.caption("Includes all items with a valid `wip_date` where `status` is NOT `DISP`. Ageing = Reference Date minus `wip_date`.")
 
@@ -1156,7 +1275,8 @@ with tab3:
     else:
         st.dataframe(
             cont_pivot.style.format({col: "{:.3f}" for col in AGEING_BUCKETS + ["Total WIP Wt (MT)"]}),
-            use_container_width=True
+            use_container_width=True,
+            hide_index=True
         )
         st.download_button(
             label="📥 Export Contractor WIP Ageing (.xlsx)",
@@ -1164,8 +1284,9 @@ with tab3:
             file_name=f"WIP_Ageing_Contractor_{ref_date_cont}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+        render_ageing_bucket_drilldown(master_df, ref_date_cont, "contractor", "Contractor", "cont_age")
 
-with tab4:
+with tab5:
     st.subheader("📜 Batch Upload Audit Log & Chronological Timeline")
     st.caption("Tracks every batch upload modification across PMH, PMG, and User1–User5, including elapsed days between consecutive stage dates.")
 
