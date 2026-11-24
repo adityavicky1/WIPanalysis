@@ -85,10 +85,10 @@ COLUMN_ALIASES = {
     ]
 }
 
-# User Credentials & Strict Role Mapping
-USERS = {
-    "admin": {"password": "admin123", "role": "admin", "target_col": None, "label": "PMH / Admin (Full View + Master Data)"},
-    "pmg":   {"password": "pmg123",   "role": "pmg",   "target_col": None, "label": "PMG (Master Builder + Drawing / Plant / Contractor / Weight)"},
+# Default User Credentials & Strict Role Mapping (seeded into DB table `app_users`)
+DEFAULT_USERS = {
+    "admin": {"password": "admin123", "role": "admin",    "target_col": None,              "label": "PMH / Admin (Full View + Master Data)"},
+    "pmg":   {"password": "pmg123",   "role": "pmg",      "target_col": None,              "label": "PMG (Master Builder + Drawing / Plant / Contractor / Weight)"},
     "user1": {"password": "user123",  "role": "uploader", "target_col": "wip_date",        "label": "User 1 (WIP Date Only)"},
     "user2": {"password": "user123",  "role": "uploader", "target_col": "plant prod date", "label": "User 2 (Plant Prod Date Only)"},
     "user3": {"password": "user123",  "role": "uploader", "target_col": "handover date",   "label": "User 3 (Handover Date Only)"},
@@ -99,7 +99,7 @@ USERS = {
 AGEING_BUCKETS = ["0-7 Days", "8-15 Days", "16-30 Days", "30-60 Days", ">60 Days"]
 
 # ---------------------------------------------------------------------------
-# 2. DATABASE (NEON POSTGRESQL / SQLITE) & BUSINESS LOGIC HELPERS
+# 2. DATABASE (NEON POSTGRESQL / SQLITE) & USER AUTH HELPERS
 # ---------------------------------------------------------------------------
 def get_db_url():
     try:
@@ -111,6 +111,14 @@ def get_db_url():
     if env_url:
         return env_url
     return f"sqlite:///{DB_FILE}"
+
+def get_admin_recovery_key():
+    try:
+        if "ADMIN_RECOVERY_KEY" in st.secrets and st.secrets["ADMIN_RECOVERY_KEY"]:
+            return str(st.secrets["ADMIN_RECOVERY_KEY"]).strip()
+    except Exception:
+        pass
+    return os.environ.get("ADMIN_RECOVERY_KEY", "").strip()
 
 @st.cache_resource
 def get_engine():
@@ -168,6 +176,78 @@ def init_db():
                 new_date TEXT
             )
         """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS app_users (
+                username TEXT PRIMARY KEY,
+                password TEXT NOT NULL,
+                role TEXT NOT NULL,
+                target_col TEXT,
+                label TEXT NOT NULL,
+                updated_at TEXT
+            )
+        """))
+
+        existing_users = pd.read_sql_query(text("SELECT username FROM app_users"), conn)
+        existing_set = set(existing_users["username"].tolist()) if not existing_users.empty else set()
+        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for uname, info in DEFAULT_USERS.items():
+            if uname not in existing_set:
+                conn.execute(
+                    text("""
+                        INSERT INTO app_users (username, password, role, target_col, label, updated_at)
+                        VALUES (:u, :p, :r, :tc, :lbl, :ts)
+                    """),
+                    {
+                        "u": uname,
+                        "p": info["password"],
+                        "r": info["role"],
+                        "tc": info["target_col"],
+                        "lbl": info["label"],
+                        "ts": now_ts
+                    }
+                )
+
+def load_users_dict():
+    engine = get_engine()
+    with engine.connect() as conn:
+        df = pd.read_sql_query(text("SELECT * FROM app_users"), conn)
+    users_map = {}
+    for _, row in df.iterrows():
+        uname = str(row["username"]).strip().lower()
+        tc = row["target_col"]
+        if pd.isna(tc) or str(tc).strip() in ("", "None", "nan"):
+            tc = None
+        users_map[uname] = {
+            "password": str(row["password"]),
+            "role": str(row["role"]),
+            "target_col": tc,
+            "label": str(row["label"]),
+            "updated_at": str(row.get("updated_at") or "")
+        }
+    return users_map
+
+def update_user_password(target_username, new_password, actor_username):
+    engine = get_engine()
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE app_users SET password = :p, updated_at = :ts WHERE username = :u"),
+            {"p": new_password, "ts": ts, "u": target_username}
+        )
+        conn.execute(
+            text("""
+                INSERT INTO audit_log (username, timestamp, "Batch No", column_updated, old_date, new_date)
+                VALUES (:u, :ts, :b, :c, :o, :n)
+            """),
+            {
+                "u": actor_username,
+                "ts": ts,
+                "b": f"USER:{target_username}",
+                "c": "PASSWORD_CHANGED",
+                "o": "********",
+                "n": "********"
+            }
+        )
 
 def write_audit_entries(entries):
     if not entries:
@@ -446,8 +526,29 @@ def upsert_master_records(incoming_df, actor_username):
     return new_count, upd_count
 
 # ---------------------------------------------------------------------------
-# 2C. PROJECT SUMMARY PIVOT, WIP AGEING & TURNAROUND ANALYTICS HELPERS
+# 2C. PROJECT SUMMARY PIVOT, WIP AGEING & STYLING HELPERS
 # ---------------------------------------------------------------------------
+def style_pivot_with_totals(df, index_col, total_col, numeric_cols):
+    """
+    Applies bold text and soft highlight background to both the GRAND TOTAL row
+    and the GRAND TOTAL / Total WIP Wt (MT) column.
+    """
+    def highlight_cells(data):
+        styles = pd.DataFrame("", index=data.index, columns=data.columns)
+        # Highlight Total Column across all rows
+        if total_col in styles.columns:
+            styles[total_col] = "font-weight: bold; background-color: #E8EEF5; color: #0F172A;"
+        # Highlight GRAND TOTAL row across all columns
+        gt_mask = data[index_col].astype(str).str.strip().str.upper() == "GRAND TOTAL"
+        styles.loc[gt_mask, :] = "font-weight: bold; background-color: #D5E2F2; color: #0F172A; border-top: 2px solid #64748B;"
+        return styles
+
+    return (
+        df.style
+        .format({col: "{:.3f}" for col in numeric_cols})
+        .apply(highlight_cells, axis=None)
+    )
+
 def build_project_status_summary_pivot(df):
     """
     Builds the Project Status Weight Summary table:
@@ -474,7 +575,6 @@ def build_project_status_summary_pivot(df):
         if c not in pivot.columns:
             pivot[c] = 0.0
 
-    # Include BLACK OK right after B&P if any records exist in BLACK OK status
     ordered_cols = ["DISP", "RFD", "B&P"]
     if "BLACK OK" in pivot.columns and pivot["BLACK OK"].sum() > 0:
         ordered_cols.append("BLACK OK")
@@ -508,10 +608,6 @@ def get_ageing_bucket(days):
         return ">60 Days"
 
 def get_active_wip_with_ageing(df, ref_date):
-    """
-    Returns active WIP rows (status != DISP and valid wip_date) annotated with
-    Age (Days) and Ageing Bucket.
-    """
     if df.empty:
         return pd.DataFrame()
 
@@ -565,10 +661,6 @@ def build_wip_ageing_pivot(df, group_col, ref_date):
     return pivot
 
 def render_ageing_bucket_drilldown(master_df, ref_date, entity_col, entity_label, key_prefix):
-    """
-    Renders a bucket & entity selector to extract the exact Project Master rows
-    falling into the selected ageing bucket (e.g. 0-7 Days) with Excel export.
-    """
     wip_aged_df = get_active_wip_with_ageing(master_df, ref_date)
     if wip_aged_df.empty:
         return
@@ -601,7 +693,6 @@ def render_ageing_bucket_drilldown(master_df, ref_date, entity_col, entity_label
 
     drill_df = drill_df.sort_values(by=["Age (Days)", "sr_no"], ascending=[False, True]).reset_index(drop=True)
 
-    # Place Ageing Bucket and Age (Days) right next to Master Columns for clarity
     display_cols = ["Ageing Bucket", "Age (Days)"] + MASTER_COLUMNS
     drill_df = drill_df[[c for c in display_cols if c in drill_df.columns]]
 
@@ -663,6 +754,7 @@ def build_stage_turnaround_df(m_row):
 # 3. INITIALIZE DB & AUTHENTICATION UI
 # ---------------------------------------------------------------------------
 init_db()
+USERS = load_users_dict()
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -690,15 +782,42 @@ if not st.session_state.logged_in:
                 else:
                     st.error("Invalid username or password.")
 
-        with st.expander("Default Credentials Reference"):
+        with st.expander("🔑 Forgot Password / Emergency Admin Recovery"):
+            st.caption(
+                "If all users forget their passwords, reset any account using the Master Recovery Key "
+                "configured in Streamlit Secrets (`ADMIN_RECOVERY_KEY`), or reset `app_users` in Neon SQL Editor."
+            )
+            configured_key = get_admin_recovery_key()
+            if configured_key:
+                with st.form("emergency_reset_form"):
+                    rec_key_input = st.text_input("Enter Master Recovery Key", type="password")
+                    rec_user = st.selectbox("Account to Reset", options=list(USERS.keys()))
+                    rec_new_pwd = st.text_input("New Password (min 4 chars)", type="password")
+                    rec_submit = st.form_submit_button("Reset Password Now", use_container_width=True)
+
+                    if rec_submit:
+                        if rec_key_input != configured_key:
+                            st.error("Invalid Master Recovery Key.")
+                        elif len(rec_new_pwd.strip()) < 4:
+                            st.error("New password must be at least 4 characters.")
+                        else:
+                            update_user_password(rec_user, rec_new_pwd.strip(), "EMERGENCY_RECOVERY")
+                            st.success(f"Password for `{rec_user}` has been reset! You can now log in.")
+            else:
+                st.info(
+                    "Tip: Add `ADMIN_RECOVERY_KEY = \"YourSecretCode\"` to Streamlit Secrets to enable "
+                    "self-service emergency password recovery here."
+                )
+
+        with st.expander("Role Reference"):
             st.markdown("""
-- **PMH / Admin:** `admin` / `admin123` *(Full View + Status Summary + Master Data Upload; Stage Dates Locked)*
-- **PMG:** `pmg` / `pmg123` *(Master Sheet Builder from Go-Live Files + Drawing Upload; Stage Dates Locked)*
-- **User 1:** `user1` / `user123` *(Batch Upload: `wip_date` ONLY)*
-- **User 2:** `user2` / `user123` *(Batch Upload: `plant prod date` ONLY)*
-- **User 3:** `user3` / `user123` *(Batch Upload: `handover date` ONLY)*
-- **User 4:** `user4` / `user123` *(Batch Upload: `rfd_date` ONLY)*
-- **User 5:** `user5` / `user123` *(Batch Upload: `dispatch_date` ONLY)*
+- **PMH / Admin (`admin`):** Full View + Status Summary + Ageing + User Password Control + Master Data Upload
+- **PMG (`pmg`):** Master Sheet Builder from Go-Live Files + Drawing Upload
+- **User 1 (`user1`):** Batch Upload (`wip_date` ONLY)
+- **User 2 (`user2`):** Batch Upload (`plant prod date` ONLY)
+- **User 3 (`user3`):** Batch Upload (`handover date` ONLY)
+- **User 4 (`user4`):** Batch Upload (`rfd_date` ONLY)
+- **User 5 (`user5`):** Batch Upload (`dispatch_date` ONLY)
             """)
     st.stop()
 
@@ -706,6 +825,11 @@ if not st.session_state.logged_in:
 # 4. SIDEBAR & DATABASE EXPORT CONTROLS
 # ---------------------------------------------------------------------------
 current_user = st.session_state.username
+if current_user not in USERS:
+    st.session_state.logged_in = False
+    st.session_state.username = None
+    st.rerun()
+
 user_info = USERS[current_user]
 role = user_info["role"]
 is_admin = role == "admin"
@@ -1177,12 +1301,13 @@ if is_pmg:
     st.stop()
 
 # Admin (PMH) Tabs
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📋 1. Project Master Sheet (PMH)",
     "📈 2. Project Status Summary",
     "📊 3. WIP Ageing — Project Wise",
     "🏭 4. WIP Ageing — Contractor Wise",
-    "📜 5. Audit Log & Batch Timeline"
+    "📜 5. Audit Log & Batch Timeline",
+    "🔐 6. User Password Management"
 ])
 
 with tab1:
@@ -1228,11 +1353,9 @@ with tab2:
         st.info("No records in Project Master yet to generate the Project Status Summary.")
     else:
         num_cols = [c for c in summary_pivot.columns if c != "PROJECT"]
-        st.dataframe(
-            summary_pivot.style.format({col: "{:.3f}" for col in num_cols}),
-            use_container_width=True,
-            hide_index=True
-        )
+        styled_summary = style_pivot_with_totals(summary_pivot, "PROJECT", "GRAND TOTAL", num_cols)
+        st.dataframe(styled_summary, use_container_width=True, hide_index=True)
+
         st.download_button(
             label="📥 Export Project Status Summary (.xlsx)",
             data=to_excel_bytes({"Project_Status_Summary": summary_pivot}),
@@ -1250,11 +1373,10 @@ with tab3:
     if proj_pivot.empty:
         st.info("No active WIP records available to calculate Project-wise ageing.")
     else:
-        st.dataframe(
-            proj_pivot.style.format({col: "{:.3f}" for col in AGEING_BUCKETS + ["Total WIP Wt (MT)"]}),
-            use_container_width=True,
-            hide_index=True
-        )
+        num_cols_proj = AGEING_BUCKETS + ["Total WIP Wt (MT)"]
+        styled_proj_pivot = style_pivot_with_totals(proj_pivot, "project_no", "Total WIP Wt (MT)", num_cols_proj)
+        st.dataframe(styled_proj_pivot, use_container_width=True, hide_index=True)
+
         st.download_button(
             label="📥 Export Project WIP Ageing (.xlsx)",
             data=to_excel_bytes({"WIP_Ageing_Project": proj_pivot}),
@@ -1273,11 +1395,10 @@ with tab4:
     if cont_pivot.empty:
         st.info("No active WIP records available to calculate Contractor-wise ageing.")
     else:
-        st.dataframe(
-            cont_pivot.style.format({col: "{:.3f}" for col in AGEING_BUCKETS + ["Total WIP Wt (MT)"]}),
-            use_container_width=True,
-            hide_index=True
-        )
+        num_cols_cont = AGEING_BUCKETS + ["Total WIP Wt (MT)"]
+        styled_cont_pivot = style_pivot_with_totals(cont_pivot, "contractor", "Total WIP Wt (MT)", num_cols_cont)
+        st.dataframe(styled_cont_pivot, use_container_width=True, hide_index=True)
+
         st.download_button(
             label="📥 Export Contractor WIP Ageing (.xlsx)",
             data=to_excel_bytes({"WIP_Ageing_Contractor": cont_pivot}),
@@ -1376,3 +1497,63 @@ with tab5:
             file_name=f"JSL_Audit_Log_{date.today()}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
+with tab6:
+    st.subheader("🔐 User Password Management & Recovery Controls")
+    st.markdown(
+        "Update your own password (`admin`) or set new passwords for `pmg` and `user1`–`user5`. "
+        "All changes are saved permanently in the database and recorded in the Audit Log."
+    )
+
+    col_pw_form, col_pw_table = st.columns([1, 1.35])
+
+    with col_pw_form:
+        st.markdown("#### ✏️ Change / Reset User Password")
+        with st.form("admin_change_password_form"):
+            target_u = st.selectbox(
+                "Select User Account:",
+                options=list(USERS.keys()),
+                format_func=lambda u: f"{u} — {USERS[u]['label']}"
+            )
+            new_pw = st.text_input("New Password (minimum 4 characters)", type="password")
+            confirm_pw = st.text_input("Confirm New Password", type="password")
+            save_pw_btn = st.form_submit_button("💾 Update Password", type="primary", use_container_width=True)
+
+            if save_pw_btn:
+                if len(new_pw.strip()) < 4:
+                    st.error("Password must be at least 4 characters long.")
+                elif new_pw.strip() != confirm_pw.strip():
+                    st.error("New password and confirmation do not match.")
+                else:
+                    update_user_password(target_u, new_pw.strip(), current_user)
+                    st.success(f"Password for **`{target_u}`** updated successfully!")
+                    st.rerun()
+
+    with col_pw_table:
+        st.markdown("#### 👥 Active Portal Accounts")
+        user_rows = []
+        for u_name, u_data in USERS.items():
+            user_rows.append({
+                "Username": u_name,
+                "Role / Access Scope": u_data["label"],
+                "Assigned Stage Column": u_data["target_col"] or "All Non-Date / Master",
+                "Last Password Update": u_data.get("updated_at") or "Default"
+            })
+        st.dataframe(pd.DataFrame(user_rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+    with st.expander("🛟 Disaster Recovery Guide: What if ALL users forget their passwords?"):
+        st.markdown("""
+1. **Method 1 — Master Recovery Key in Streamlit Secrets (Fastest Self-Service):**
+   * In Streamlit Cloud (**App Settings → Secrets**) or your server environment variables, add:
+     ```toml
+     ADMIN_RECOVERY_KEY = "JSL-FabTech-Reset-2026"
+     ```
+   * On the Login Screen, open **🔑 Forgot Password / Emergency Admin Recovery**, enter that recovery key, select `admin` (or any user), and set a new password immediately.
+2. **Method 2 — Neon PostgreSQL SQL Editor (Direct Database Reset):**
+   * Log in to your Neon Console, open **SQL Editor**, and run:
+     ```sql
+     UPDATE app_users SET password = 'NewAdminPassword123' WHERE username = 'admin';
+     ```
+   * Or run `DELETE FROM app_users;` and reload the Streamlit app to automatically restore all default credentials (`admin123`, `pmg123`, `user123`).
+        """)
