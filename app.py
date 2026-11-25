@@ -276,44 +276,42 @@ def load_audit_log_df():
 
 def clean_part_sl_no(val):
     """
-    Ensures part_sl_no stays strictly in text format (e.g. '1/2', '2/2').
-    Recovers values that Excel auto-converted into datetime objects or ISO date strings
-    when a fraction like '1/2' or '2/2' was entered without text formatting.
+    Keeps part_sl_no strictly as text ('1/2', '2/2', etc.).
+    In DD-MM-YYYY (Indian/UK) Excel locale, typing '1/2' is stored by Excel as
+    1st February (datetime(YYYY, 2, 1)), so recovery uses day/month -> '1/2'.
     """
     if pd.isna(val) or val is None:
         return ""
     if isinstance(val, (datetime, date, pd.Timestamp)):
-        return f"{val.month}/{val.day}"
+        return f"{val.day}/{val.month}"
 
     s = str(val).strip()
     if s == "" or s.lower() in ("nan", "nat", "none", "null"):
         return ""
 
-    # Strip accidental leading apostrophe from Excel text-forced cells
     if s.startswith("'"):
         s = s[1:].strip()
 
-    # Recover ISO date strings produced by openpyxl/pandas from '1/2' -> '2026-01-02 00:00:00'
+    # Recover ISO date strings ('2026-02-01 00:00:00' -> day=1, month=2 -> '1/2')
     iso_match = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?)?$", s)
     if iso_match:
         month_num = int(iso_match.group(2))
         day_num = int(iso_match.group(3))
-        return f"{month_num}/{day_num}"
+        return f"{day_num}/{month_num}"
 
-    # Recover 'DD-MMM' or 'MMM-YY' style strings if Excel formatted '1/2' as '02-Jan' or 'Jan-02'
+    # Recover '01-Feb' / '02-Feb' strings -> '1/2' / '2/2'
     month_map = {
         "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
         "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
     }
-    d_mmm = re.match(r"^(\d{1,2})[-/]([A-Za-z]{3})$", s)
+    d_mmm = re.match(r"^(\d{1,2})[-/]([A-Za-z]{3})(?:[-/]\d{2,4})?$", s)
     if d_mmm and d_mmm.group(2).lower() in month_map:
-        return f"{month_map[d_mmm.group(2).lower()]}/{int(d_mmm.group(1))}"
+        return f"{int(d_mmm.group(1))}/{month_map[d_mmm.group(2).lower()]}"
 
     mmm_d = re.match(r"^([A-Za-z]{3})[-/](\d{1,2})$", s)
     if mmm_d and mmm_d.group(1).lower() in month_map:
-        return f"{month_map[mmm_d.group(1).lower()]}/{int(mmm_d.group(2))}"
+        return f"{int(mmm_d.group(2))}/{month_map[mmm_d.group(1).lower()]}"
 
-    # Clean integer floats like '1.0' -> '1'
     if re.match(r"^\d+\.0$", s):
         return s[:-2]
 
@@ -397,15 +395,16 @@ def to_excel_bytes(df_dict):
                 df_export["part_sl_no"] = df_export["part_sl_no"].apply(clean_part_sl_no).astype(str)
             df_export.to_excel(writer, index=False, sheet_name=clean_sheet)
 
-            # Explicitly format text columns as '@' in Excel so '1/2', '2/2' never convert to dates
+            # Force explicit string data_type ('s') and '@' text format in openpyxl
             ws = writer.sheets[clean_sheet]
             for col_idx, col_name in enumerate(df_export.columns, start=1):
                 if col_name in text_cols_to_lock:
                     for row_idx in range(2, len(df_export) + 2):
                         cell = ws.cell(row=row_idx, column=col_idx)
+                        val_str = "" if cell.value is None else str(cell.value)
+                        cell.value = val_str
+                        cell.data_type = "s"
                         cell.number_format = "@"
-                        if cell.value is not None:
-                            cell.value = str(cell.value)
     return output.getvalue()
 
 # ---------------------------------------------------------------------------
@@ -598,10 +597,6 @@ def upsert_master_records(incoming_df, actor_username):
 # 2C. PROJECT SUMMARY PIVOT, WIP AGEING & STYLING HELPERS
 # ---------------------------------------------------------------------------
 def style_pivot_with_totals(df, index_col, total_col, numeric_cols):
-    """
-    Applies bold text and soft highlight background to both the GRAND TOTAL row
-    and the GRAND TOTAL / Total WIP Wt (MT) column.
-    """
     def highlight_cells(data):
         styles = pd.DataFrame("", index=data.index, columns=data.columns)
         if total_col in styles.columns:
@@ -617,10 +612,6 @@ def style_pivot_with_totals(df, index_col, total_col, numeric_cols):
     )
 
 def build_project_status_summary_pivot(df):
-    """
-    Builds the Project Status Weight Summary table:
-    PROJECT | DISP | RFD | B&P | [BLACK OK if > 0] | WIP | YTS | GRAND TOTAL
-    """
     if df.empty:
         return pd.DataFrame()
 
@@ -741,7 +732,7 @@ def render_ageing_bucket_drilldown(master_df, ref_date, entity_col, entity_label
     selected_bucket = c1.selectbox(
         "Select Ageing Bucket:",
         options=bucket_options,
-        index=1,  # Defaults to '0-7 Days'
+        index=1,
         key=f"{key_prefix}_bucket_sel"
     )
 
@@ -1614,15 +1605,15 @@ with tab6:
     with st.expander("🛟 Disaster Recovery Guide: What if ALL users forget their passwords?"):
         st.markdown("""
 1. **Method 1 — Master Recovery Key in Streamlit Secrets (Fastest Self-Service):**
-  - In Streamlit Cloud (**App Settings → Secrets**) or your server environment variables, add:
+   - In Streamlit Cloud (**App Settings → Secrets**) or your server environment variables, add:
      ```toml
      ADMIN_RECOVERY_KEY = "JSL-FabTech-Reset-2026"
      ```
-- On the Login Screen, open **🔑 Forgot Password / Emergency Admin Recovery**, enter that recovery key, select `admin` (or any user), and set a new password immediately.
+   - On the Login Screen, open **🔑 Forgot Password / Emergency Admin Recovery**, enter that recovery key, select `admin` (or any user), and set a new password immediately.
 2. **Method 2 — Neon PostgreSQL SQL Editor (Direct Database Reset):**
-- Log in to your Neon Console, open **SQL Editor**, and run:
+   - Log in to your Neon Console, open **SQL Editor**, and run:
      ```sql
      UPDATE app_users SET password = 'NewAdminPassword123' WHERE username = 'admin';
      ```
-- Or run `DELETE FROM app_users;` and reload the Streamlit app to automatically restore all default credentials (`admin123`, `pmg123`, `user123`).
+   - Or run `DELETE FROM app_users;` and reload the Streamlit app to automatically restore all default credentials (`admin123`, `pmg123`, `user123`).
         """)
