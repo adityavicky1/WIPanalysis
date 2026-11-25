@@ -274,6 +274,51 @@ def load_audit_log_df():
         df["Batch No"] = df["Batch No"].astype(str).str.strip()
     return df
 
+def clean_part_sl_no(val):
+    """
+    Ensures part_sl_no stays strictly in text format (e.g. '1/2', '2/2').
+    Recovers values that Excel auto-converted into datetime objects or ISO date strings
+    when a fraction like '1/2' or '2/2' was entered without text formatting.
+    """
+    if pd.isna(val) or val is None:
+        return ""
+    if isinstance(val, (datetime, date, pd.Timestamp)):
+        return f"{val.month}/{val.day}"
+
+    s = str(val).strip()
+    if s == "" or s.lower() in ("nan", "nat", "none", "null"):
+        return ""
+
+    # Strip accidental leading apostrophe from Excel text-forced cells
+    if s.startswith("'"):
+        s = s[1:].strip()
+
+    # Recover ISO date strings produced by openpyxl/pandas from '1/2' -> '2026-01-02 00:00:00'
+    iso_match = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?)?$", s)
+    if iso_match:
+        month_num = int(iso_match.group(2))
+        day_num = int(iso_match.group(3))
+        return f"{month_num}/{day_num}"
+
+    # Recover 'DD-MMM' or 'MMM-YY' style strings if Excel formatted '1/2' as '02-Jan' or 'Jan-02'
+    month_map = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
+    }
+    d_mmm = re.match(r"^(\d{1,2})[-/]([A-Za-z]{3})$", s)
+    if d_mmm and d_mmm.group(2).lower() in month_map:
+        return f"{month_map[d_mmm.group(2).lower()]}/{int(d_mmm.group(1))}"
+
+    mmm_d = re.match(r"^([A-Za-z]{3})[-/](\d{1,2})$", s)
+    if mmm_d and mmm_d.group(1).lower() in month_map:
+        return f"{month_map[mmm_d.group(1).lower()]}/{int(mmm_d.group(2))}"
+
+    # Clean integer floats like '1.0' -> '1'
+    if re.match(r"^\d+\.0$", s):
+        return s[:-2]
+
+    return s
+
 def clean_date_str(val):
     if pd.isna(val) or val is None:
         return ""
@@ -315,7 +360,7 @@ def load_master_df():
     with engine.connect() as conn:
         df = pd.read_sql_query(text("SELECT * FROM project_master ORDER BY sr_no ASC"), conn)
     if not df.empty:
-        df["part_sl_no"] = df["part_sl_no"].astype(str)
+        df["part_sl_no"] = df["part_sl_no"].apply(clean_part_sl_no).astype(str)
         df["Batch No"] = df["Batch No"].astype(str).str.strip()
         df["project_no"] = df["project_no"].astype(str).str.strip()
         df = recalculate_all_statuses(df)
@@ -327,6 +372,7 @@ def save_master_df(df):
         if col not in df.columns:
             df[col] = ""
     df = df[MASTER_COLUMNS].copy()
+    df["part_sl_no"] = df["part_sl_no"].apply(clean_part_sl_no).astype(str)
     df["sr_no"] = pd.to_numeric(df["sr_no"], errors="coerce").fillna(0).astype(int)
     df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0).astype(int)
     df["actual_wt"] = pd.to_numeric(df["actual_wt"], errors="coerce").fillna(0.0).astype(float)
@@ -342,9 +388,24 @@ def save_master_df(df):
 
 def to_excel_bytes(df_dict):
     output = io.BytesIO()
+    text_cols_to_lock = {"part_sl_no", "Batch No", "project_no", "revision_no", "drawing_no", "mark_no"}
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for sheet_name, df in df_dict.items():
-            df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+            clean_sheet = sheet_name[:31]
+            df_export = df.copy()
+            if "part_sl_no" in df_export.columns:
+                df_export["part_sl_no"] = df_export["part_sl_no"].apply(clean_part_sl_no).astype(str)
+            df_export.to_excel(writer, index=False, sheet_name=clean_sheet)
+
+            # Explicitly format text columns as '@' in Excel so '1/2', '2/2' never convert to dates
+            ws = writer.sheets[clean_sheet]
+            for col_idx, col_name in enumerate(df_export.columns, start=1):
+                if col_name in text_cols_to_lock:
+                    for row_idx in range(2, len(df_export) + 2):
+                        cell = ws.cell(row=row_idx, column=col_idx)
+                        cell.number_format = "@"
+                        if cell.value is not None:
+                            cell.value = str(cell.value)
     return output.getvalue()
 
 # ---------------------------------------------------------------------------
@@ -461,7 +522,11 @@ def extract_standardized_df(raw_df, col_map, fallback_project_no="", start_sr_no
     out["draw_total_wt"] = pd.to_numeric(out["draw_total_wt"], errors="coerce")
     out["draw_total_wt"] = out["draw_total_wt"].fillna(out["actual_wt"]).round(5)
 
-    for txt_col in ["description", "revision_no", "drawing_no", "element_type", "mark_no", "part_sl_no", "contractor", "plant"]:
+    # Convert part_sl_no strictly as text (recovering '1/2', '2/2' if Excel stored as date)
+    out["part_sl_no"] = out["part_sl_no"].apply(clean_part_sl_no).astype(str)
+
+    # Clean remaining text fields
+    for txt_col in ["description", "revision_no", "drawing_no", "element_type", "mark_no", "contractor", "plant"]:
         out[txt_col] = out[txt_col].fillna("").astype(str).str.strip()
         out.loc[out[txt_col].isin(["nan", "None", "NaT"]), txt_col] = ""
 
@@ -482,6 +547,10 @@ def upsert_master_records(incoming_df, actor_username):
         c for c in ["drawing_no", "revision_no", "contractor", "plant", "actual_wt", "qty"]
         if c in incoming_df.columns
     ]
+
+    if "part_sl_no" in incoming_df.columns:
+        incoming_df = incoming_df.copy()
+        incoming_df["part_sl_no"] = incoming_df["part_sl_no"].apply(clean_part_sl_no).astype(str)
 
     existing_batches = set(current_master["Batch No"]) if not current_master.empty else set()
     new_count = int((~incoming_df["Batch No"].isin(existing_batches)).sum())
@@ -535,10 +604,8 @@ def style_pivot_with_totals(df, index_col, total_col, numeric_cols):
     """
     def highlight_cells(data):
         styles = pd.DataFrame("", index=data.index, columns=data.columns)
-        # Highlight Total Column across all rows
         if total_col in styles.columns:
             styles[total_col] = "font-weight: bold; background-color: #E8EEF5; color: #0F172A;"
-        # Highlight GRAND TOTAL row across all columns
         gt_mask = data[index_col].astype(str).str.strip().str.upper() == "GRAND TOTAL"
         styles.loc[gt_mask, :] = "font-weight: bold; background-color: #D5E2F2; color: #0F172A; border-top: 2px solid #64748B;"
         return styles
@@ -1050,7 +1117,7 @@ def render_master_data_uploader(uploader_role_label, allow_full_replace=False):
         {
             "sr_no": 2, "Batch No": "ABC124", "project_no": "201", "description": "CT-T1",
             "revision_no": "Rev-2", "drawing_no": "DP16004-VN02-90UHA-370005-UHASHEET-96/373",
-            "element_type": "GIRDER", "mark_no": "1T10G53", "qty": 1, "part_sl_no": "1/1",
+            "element_type": "GIRDER", "mark_no": "1T10G53", "qty": 1, "part_sl_no": "2/2",
             "actual_wt": 3.862, "draw_total_wt": 3.862, "contractor": "CTF", "plant": "PLANT-2"
         }
     ])
@@ -1106,6 +1173,8 @@ def render_master_data_uploader(uploader_role_label, allow_full_replace=False):
                 st.warning("No valid rows with non-blank `Batch No` found.")
                 return
 
+            if "part_sl_no" in incoming_df.columns:
+                incoming_df["part_sl_no"] = incoming_df["part_sl_no"].apply(clean_part_sl_no).astype(str)
             if "sr_no" in incoming_df.columns:
                 incoming_df["sr_no"] = pd.to_numeric(incoming_df["sr_no"], errors="coerce").fillna(0).astype(int)
             if "qty" in incoming_df.columns:
@@ -1545,15 +1614,15 @@ with tab6:
     with st.expander("🛟 Disaster Recovery Guide: What if ALL users forget their passwords?"):
         st.markdown("""
 1. **Method 1 — Master Recovery Key in Streamlit Secrets (Fastest Self-Service):**
-   * In Streamlit Cloud (**App Settings → Secrets**) or your server environment variables, add:
+  - In Streamlit Cloud (**App Settings → Secrets**) or your server environment variables, add:
      ```toml
      ADMIN_RECOVERY_KEY = "JSL-FabTech-Reset-2026"
      ```
-   * On the Login Screen, open **🔑 Forgot Password / Emergency Admin Recovery**, enter that recovery key, select `admin` (or any user), and set a new password immediately.
+- On the Login Screen, open **🔑 Forgot Password / Emergency Admin Recovery**, enter that recovery key, select `admin` (or any user), and set a new password immediately.
 2. **Method 2 — Neon PostgreSQL SQL Editor (Direct Database Reset):**
-   * Log in to your Neon Console, open **SQL Editor**, and run:
+- Log in to your Neon Console, open **SQL Editor**, and run:
      ```sql
      UPDATE app_users SET password = 'NewAdminPassword123' WHERE username = 'admin';
      ```
-   * Or run `DELETE FROM app_users;` and reload the Streamlit app to automatically restore all default credentials (`admin123`, `pmg123`, `user123`).
+- Or run `DELETE FROM app_users;` and reload the Streamlit app to automatically restore all default credentials (`admin123`, `pmg123`, `user123`).
         """)
