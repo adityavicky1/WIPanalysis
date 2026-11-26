@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import io
 import os
 import re
@@ -97,6 +98,7 @@ DEFAULT_USERS = {
 }
 
 AGEING_BUCKETS = ["0-7 Days", "8-15 Days", "16-30 Days", "30-60 Days", ">60 Days"]
+ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # ---------------------------------------------------------------------------
 # 2. DATABASE (NEON POSTGRESQL / SQLITE) & USER AUTH HELPERS
@@ -137,7 +139,8 @@ def get_engine():
 def is_postgres():
     return get_engine().dialect.name == "postgresql"
 
-def init_db():
+@st.cache_resource
+def ensure_db_initialized():
     engine = get_engine()
     id_col = "id SERIAL PRIMARY KEY" if is_postgres() else "id INTEGER PRIMARY KEY AUTOINCREMENT"
     with engine.begin() as conn:
@@ -206,8 +209,14 @@ def init_db():
                         "ts": now_ts
                     }
                 )
+    return True
 
+def init_db():
+    ensure_db_initialized()
+
+@st.cache_data(ttl=20)
 def load_users_dict():
+    ensure_db_initialized()
     engine = get_engine()
     with engine.connect() as conn:
         df = pd.read_sql_query(text("SELECT * FROM app_users"), conn)
@@ -248,6 +257,7 @@ def update_user_password(target_username, new_password, actor_username):
                 "n": "********"
             }
         )
+    st.cache_data.clear()
 
 def write_audit_entries(entries):
     if not entries:
@@ -265,8 +275,11 @@ def write_audit_entries(entries):
             """),
             payload
         )
+    st.cache_data.clear()
 
+@st.cache_data(ttl=20)
 def load_audit_log_df():
+    ensure_db_initialized()
     engine = get_engine()
     with engine.connect() as conn:
         df = pd.read_sql_query(text('SELECT * FROM audit_log ORDER BY id DESC'), conn)
@@ -320,40 +333,73 @@ def clean_part_sl_no(val):
 def clean_date_str(val):
     if pd.isna(val) or val is None:
         return ""
+    if isinstance(val, (datetime, date, pd.Timestamp)):
+        return val.strftime("%Y-%m-%d")
     s = str(val).strip()
     if s == "" or s.lower() in ("nan", "nat", "none", "null"):
         return ""
+    if ISO_DATE_RE.match(s):
+        return s
     try:
         dt = pd.to_datetime(s)
         return dt.strftime("%Y-%m-%d")
     except Exception:
         return s
 
-def compute_status(row):
-    if clean_date_str(row.get("dispatch_date")) != "":
+def compute_status_from_dates(wip_s, prod_s, ho_s, rfd_s, disp_s):
+    if disp_s != "":
         return "DISP"
-    if clean_date_str(row.get("rfd_date")) != "":
+    if rfd_s != "":
         return "RFD"
-    if clean_date_str(row.get("handover date")) != "":
+    if ho_s != "":
         return "B&P"
-    if clean_date_str(row.get("plant prod date")) != "":
+    if prod_s != "":
         return "BLACK OK"
-    if clean_date_str(row.get("wip_date")) != "":
+    if wip_s != "":
         return "WIP"
     return "YTS"
+
+def compute_status(row):
+    return compute_status_from_dates(
+        clean_date_str(row.get("wip_date")),
+        clean_date_str(row.get("plant prod date")),
+        clean_date_str(row.get("handover date")),
+        clean_date_str(row.get("rfd_date")),
+        clean_date_str(row.get("dispatch_date")),
+    )
 
 def recalculate_all_statuses(df):
     if df.empty:
         return df
+    out = df.copy()
     for col in DATE_COLUMNS:
-        if col in df.columns:
-            df[col] = df[col].apply(clean_date_str)
+        if col not in out.columns:
+            out[col] = ""
         else:
-            df[col] = ""
-    df["status"] = df.apply(compute_status, axis=1)
-    return df
+            s = out[col].fillna("").astype(str).str.strip()
+            needs_parse = ~s.str.match(r"^\d{4}-\d{2}-\d{2}$") & ~s.isin(["", "nan", "NaT", "None", "null"])
+            if needs_parse.any():
+                parsed = pd.to_datetime(s[needs_parse], errors="coerce")
+                s.loc[needs_parse] = parsed.dt.strftime("%Y-%m-%d").fillna(s[needs_parse])
+            s.loc[s.str.lower().isin(["nan", "nat", "none", "null"])] = ""
+            out[col] = s
 
+    disp_has = out["dispatch_date"] != ""
+    rfd_has = out["rfd_date"] != ""
+    ho_has = out["handover date"] != ""
+    prod_has = out["plant prod date"] != ""
+    wip_has = out["wip_date"] != ""
+
+    out["status"] = np.select(
+        [disp_has, rfd_has, ho_has, prod_has, wip_has],
+        ["DISP", "RFD", "B&P", "BLACK OK", "WIP"],
+        default="YTS"
+    )
+    return out
+
+@st.cache_data(ttl=20)
 def load_master_df():
+    ensure_db_initialized()
     engine = get_engine()
     with engine.connect() as conn:
         df = pd.read_sql_query(text("SELECT * FROM project_master ORDER BY sr_no ASC"), conn)
@@ -383,6 +429,83 @@ def save_master_df(df):
             conn.execute(text('ALTER TABLE project_master ADD PRIMARY KEY ("Batch No")'))
         else:
             conn.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS idx_batch_no ON project_master ("Batch No")'))
+    st.cache_data.clear()
+
+def apply_stage_date_updates(target_col, date_map, actor_username):
+    """
+    Targeted row update for stage uploads (user1 - user5): updates only the
+    changed Batch No rows and recalculates their status in the database.
+    """
+    if not date_map:
+        return 0
+    engine = get_engine()
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    audit_rows = []
+    batch_keys = list(date_map.keys())
+
+    with engine.begin() as conn:
+        # Fetch existing stage dates for matched batches to build accurate audit entries & statuses
+        placeholders = ", ".join([f":b{i}" for i in range(len(batch_keys))])
+        params = {f"b{i}": b for i, b in enumerate(batch_keys)}
+        existing_rows = conn.execute(
+            text(f"""
+                SELECT "Batch No", wip_date, "plant prod date", "handover date", rfd_date, dispatch_date
+                FROM project_master
+                WHERE "Batch No" IN ({placeholders})
+            """),
+            params
+        ).fetchall()
+
+        quoted_target = f'"{target_col}"' if " " in target_col else target_col
+        updated_count = 0
+
+        for r in existing_rows:
+            b_no = str(r[0]).strip()
+            vals = {
+                "wip_date": clean_date_str(r[1]),
+                "plant prod date": clean_date_str(r[2]),
+                "handover date": clean_date_str(r[3]),
+                "rfd_date": clean_date_str(r[4]),
+                "dispatch_date": clean_date_str(r[5]),
+            }
+            old_d = vals[target_col]
+            new_d = clean_date_str(date_map[b_no])
+            vals[target_col] = new_d
+            new_status = compute_status_from_dates(
+                vals["wip_date"],
+                vals["plant prod date"],
+                vals["handover date"],
+                vals["rfd_date"],
+                vals["dispatch_date"],
+            )
+
+            conn.execute(
+                text(f"""
+                    UPDATE project_master
+                    SET {quoted_target} = :new_d, status = :new_status
+                    WHERE "Batch No" = :b_no
+                """),
+                {"new_d": new_d, "new_status": new_status, "b_no": b_no}
+            )
+            updated_count += 1
+
+            if old_d != new_d:
+                audit_rows.append((actor_username, ts, b_no, target_col, old_d, new_d))
+
+        if audit_rows:
+            conn.execute(
+                text("""
+                    INSERT INTO audit_log (username, timestamp, "Batch No", column_updated, old_date, new_date)
+                    VALUES (:u, :ts, :b, :c, :o, :n)
+                """),
+                [
+                    {"u": e[0], "ts": e[1], "b": e[2], "c": e[3], "o": e[4], "n": e[5]}
+                    for e in audit_rows
+                ]
+            )
+
+    st.cache_data.clear()
+    return updated_count
 
 def to_excel_bytes(df_dict):
     output = io.BytesIO()
@@ -611,6 +734,7 @@ def style_pivot_with_totals(df, index_col, total_col, numeric_cols):
         .apply(highlight_cells, axis=None)
     )
 
+@st.cache_data(ttl=20)
 def build_project_status_summary_pivot(df):
     if df.empty:
         return pd.DataFrame()
@@ -685,6 +809,7 @@ def get_active_wip_with_ageing(df, ref_date):
     wip_df["contractor"] = wip_df["contractor"].fillna("Unassigned").replace("", "Unassigned")
     return wip_df.drop(columns=["wip_dt"])
 
+@st.cache_data(ttl=20)
 def build_wip_ageing_pivot(df, group_col, ref_date):
     wip_df = get_active_wip_with_ageing(df, ref_date)
     if wip_df.empty:
@@ -893,6 +1018,8 @@ role = user_info["role"]
 is_admin = role == "admin"
 is_pmg = role == "pmg"
 
+master_df = load_master_df()
+
 with st.sidebar:
     if os.path.exists(CLIENT_LOGO_FILE):
         st.image(CLIENT_LOGO_FILE, width=160)
@@ -908,24 +1035,28 @@ with st.sidebar:
     st.divider()
     st.header("💾 Export & Backup")
 
-    master_df = load_master_df()
-    audit_df = load_audit_log_df()
-
     if is_admin:
-        summary_pivot_export = build_project_status_summary_pivot(master_df)
-        export_sheets = {
-            "Project_Master": master_df,
-            "Project_Status_Summary": summary_pivot_export,
-            "Audit_Log": audit_df
-        }
-        excel_export = to_excel_bytes(export_sheets)
-        st.download_button(
-            label="📥 Export Full Workbook (.xlsx)",
-            data=excel_export,
-            file_name=f"JSL_WIP_Export_{date.today()}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
+        if "full_workbook_bytes" not in st.session_state:
+            st.session_state.full_workbook_bytes = None
+
+        if st.button("⚙️ Prepare Full Workbook (.xlsx)", use_container_width=True):
+            audit_df_export = load_audit_log_df()
+            summary_pivot_export = build_project_status_summary_pivot(master_df)
+            export_sheets = {
+                "Project_Master": master_df,
+                "Project_Status_Summary": summary_pivot_export,
+                "Audit_Log": audit_df_export
+            }
+            st.session_state.full_workbook_bytes = to_excel_bytes(export_sheets)
+
+        if st.session_state.full_workbook_bytes is not None:
+            st.download_button(
+                label="📥 Download Full Workbook (.xlsx)",
+                data=st.session_state.full_workbook_bytes,
+                file_name=f"JSL_WIP_Export_{date.today()}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
     else:
         st.info("Full workbook export is restricted to PMH (Admin).")
 
@@ -1039,6 +1170,7 @@ def render_pmg_master_builder():
                     fallback_project_no=proj_override,
                     start_sr_no=running_sr
                 )
+                del full_raw_df
 
                 if clean_part_df.empty:
                     st.warning(f"No valid rows with non-blank `Batch No` extracted from `{fname}` ({selected_sheet}).")
@@ -1082,6 +1214,7 @@ def render_pmg_master_builder():
         with col_db:
             if st.button("🚀 Save Extracted Master Data Directly to Database", type="primary", use_container_width=True):
                 new_cnt, upd_cnt = upsert_master_records(combined_df, current_user)
+                st.session_state.full_workbook_bytes = None
                 st.success(
                     f"Saved {len(combined_df)} standardized records ({new_cnt} new batches added, "
                     f"{upd_cnt} existing batches updated) while preserving all stage dates!"
@@ -1155,6 +1288,8 @@ def render_master_data_uploader(uploader_role_label, allow_full_replace=False):
 
             present_data_cols = [c for c in MASTER_DATA_COLUMNS if c in raw_df.columns]
             incoming_df = raw_df[present_data_cols].copy()
+            del raw_df
+
             incoming_df["Batch No"] = incoming_df["Batch No"].astype(str).str.strip()
             incoming_df = incoming_df[
                 (incoming_df["Batch No"] != "") & (incoming_df["Batch No"].str.lower() != "nan")
@@ -1193,6 +1328,7 @@ def render_master_data_uploader(uploader_role_label, allow_full_replace=False):
                     return
 
                 new_cnt, upd_cnt = upsert_master_records(incoming_df, current_user)
+                st.session_state.full_workbook_bytes = None
                 st.success(
                     f"Saved {len(incoming_df)} records ({new_cnt} added, {upd_cnt} updated) "
                     f"with all stage dates preserved!"
@@ -1316,25 +1452,14 @@ def render_stage_uploader(target_col, role_title):
             )
 
             if st.button("✅ Confirm & Apply Update to Master Sheet", type="primary", disabled=not confirm_chk):
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                audit_rows = []
-                date_map = {}
-
-                for _, row in matched.iterrows():
-                    b_no = row["Batch No"]
-                    old_d = clean_date_str(row["Existing_Date"])
-                    new_d = clean_date_str(row["New_Date"])
-                    date_map[b_no] = new_d
-                    if old_d != new_d:
-                        audit_rows.append((current_user, ts, b_no, target_col, old_d, new_d))
-
-                mask = current_master["Batch No"].isin(date_map.keys())
-                current_master.loc[mask, target_col] = current_master.loc[mask, "Batch No"].map(date_map)
-                save_master_df(current_master)
-                write_audit_entries(audit_rows)
-
+                date_map = {
+                    str(row["Batch No"]).strip(): clean_date_str(row["New_Date"])
+                    for _, row in matched.iterrows()
+                }
+                updated_cnt = apply_stage_date_updates(target_col, date_map, current_user)
+                st.session_state.full_workbook_bytes = None
                 st.success(
-                    f"Updated `{target_col}` for {len(matched)} batches, logged {len(audit_rows)} changes to Audit Log, "
+                    f"Updated `{target_col}` for {updated_cnt} batches, logged changes to Audit Log, "
                     f"and recalculated statuses!"
                 )
                 st.rerun()
@@ -1471,6 +1596,8 @@ with tab5:
     st.subheader("📜 Batch Upload Audit Log & Chronological Timeline")
     st.caption("Tracks every batch upload modification across PMH, PMG, and User1–User5, including elapsed days between consecutive stage dates.")
 
+    audit_df = load_audit_log_df()
+
     if audit_df.empty:
         st.info("No audit log entries recorded yet.")
     else:
@@ -1605,15 +1732,15 @@ with tab6:
     with st.expander("🛟 Disaster Recovery Guide: What if ALL users forget their passwords?"):
         st.markdown("""
 1. **Method 1 — Master Recovery Key in Streamlit Secrets (Fastest Self-Service):**
-   - In Streamlit Cloud (**App Settings → Secrets**) or your server environment variables, add:
+  - In Streamlit Cloud (**App Settings → Secrets**) or your server environment variables, add:
      ```toml
      ADMIN_RECOVERY_KEY = "JSL-FabTech-Reset-2026"
      ```
-   - On the Login Screen, open **🔑 Forgot Password / Emergency Admin Recovery**, enter that recovery key, select `admin` (or any user), and set a new password immediately.
+- On the Login Screen, open **🔑 Forgot Password / Emergency Admin Recovery**, enter that recovery key, select `admin` (or any user), and set a new password immediately.
 2. **Method 2 — Neon PostgreSQL SQL Editor (Direct Database Reset):**
-   - Log in to your Neon Console, open **SQL Editor**, and run:
+- Log in to your Neon Console, open **SQL Editor**, and run:
      ```sql
      UPDATE app_users SET password = 'NewAdminPassword123' WHERE username = 'admin';
      ```
-   - Or run `DELETE FROM app_users;` and reload the Streamlit app to automatically restore all default credentials (`admin123`, `pmg123`, `user123`).
+- Or run `DELETE FROM app_users;` and reload the Streamlit app to automatically restore all default credentials (`admin123`, `pmg123`, `user123`).
         """)
